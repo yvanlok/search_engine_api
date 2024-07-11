@@ -7,7 +7,7 @@ use dotenv::dotenv;
 use tokio::fs::File;
 use tokio::io::{ self, AsyncBufReadExt };
 use url::Url;
-use std::time::Instant;
+use std::time::{ Duration, Instant };
 
 mod lemmatise;
 mod database;
@@ -210,13 +210,13 @@ fn format_result(
 fn format_timing_info(timing: &RequestTiming, total_request_time: std::time::Duration) -> Value {
     json!({
         "total_request": format!("{:?}", total_request_time),
-        "total_search_function": format!("{:?}", timing.total_search_function.unwrap()),
-        "lemmatisation": format!("{:?}", timing.lemmatisation.unwrap()),
-        "initial_database_query": format!("{:?}", timing.initial_database_query.unwrap()),
-        "tf_idf_calculation": format!("{:?}", timing.tf_idf_calculation.unwrap()),
-        "link_fetching": format!("{:?}", timing.link_fetching.unwrap()),
-        "results_formatting": format!("{:?}", timing.results_formatting.unwrap()),
-        "other_operations": format!("{:?}", total_request_time - timing.total_search_function.unwrap()),
+        "total_search_function": format!("{:?}", timing.total_search_function.unwrap_or_default()),
+        "lemmatisation": format!("{:?}", timing.lemmatisation.unwrap_or_default()),
+        "initial_database_query": format!("{:?}", timing.initial_database_query.unwrap_or_default()),
+        "tf_idf_calculation": format!("{:?}", timing.tf_idf_calculation.unwrap_or_default()),
+        "link_fetching": format!("{:?}", timing.link_fetching.unwrap_or_default()),
+        "results_formatting": format!("{:?}", timing.results_formatting.unwrap_or_default()),
+        "other_operations": format!("{:?}", total_request_time - timing.total_search_function.unwrap_or_default()),
     })
 }
 
