@@ -5,6 +5,7 @@ use std::error::Error;
 /// Represents a webpage with its associated metadata and keyword information
 #[derive(Debug, Clone)]
 pub struct Webpage {
+    pub id: i32,
     pub title: String,
     pub url: String,
     pub description: String,
@@ -74,6 +75,7 @@ pub async fn fetch_webpages(
 
         // Use entry API for efficient map operations
         let webpage_struct = webpages_map.entry(webpage_id).or_insert_with(|| Webpage {
+            id: webpage_id,
             title: row.get("title"),
             url: row.get("url"),
             description: row.get("description"),
@@ -148,6 +150,53 @@ pub async fn fetch_links(
             .map(|(id, (to_count, from))| (id, to_count, from))
             .collect()
     )
+}
+
+pub async fn fetch_links_for_ids(
+    pool: &PgPool,
+    webpage_ids: &[i32]
+) -> Result<HashMap<i32, (usize, HashMap<String, i32>)>, Box<dyn Error>> {
+    // Prepare the SQL query to fetch link information for specific webpage IDs
+    let query =
+        r#"
+        SELECT 
+            w.id as website_id,
+            COUNT(DISTINCT wt.target_website) as links_to_count,
+            ws.url as source_website
+        FROM 
+            websites w
+        LEFT JOIN 
+            website_links wt ON w.id = wt.source_website_id
+        LEFT JOIN 
+            website_links wl ON wl.target_website = w.url
+        LEFT JOIN 
+            websites ws ON ws.id = wl.source_website_id
+        WHERE
+            w.id = ANY($1::int[])
+        GROUP BY w.id, ws.url
+    "#;
+
+    // Execute the query and fetch all rows
+    let rows: Vec<PgRow> = sqlx::query(query).bind(webpage_ids).fetch_all(pool).await?;
+
+    // Use a HashMap to efficiently build link information
+    let mut links_map: HashMap<i32, (usize, HashMap<String, i32>)> = HashMap::new();
+
+    // Process each row and populate the links_map
+    for row in rows {
+        let webpage_id: i32 = row.get("website_id");
+        let links_to_count: i64 = row.get("links_to_count");
+        let source_website: Option<String> = row.get("source_website");
+
+        let entry = links_map
+            .entry(webpage_id)
+            .or_insert((links_to_count as usize, HashMap::new()));
+        if let Some(source) = source_website {
+            *entry.1.entry(source).or_insert(0) += 1;
+        }
+    }
+
+    Ok(links_map)
 }
 
 pub async fn count_websites(pool: &PgPool) -> Result<i64, Box<dyn Error>> {

@@ -18,8 +18,9 @@ mod ranking;
 struct RequestTiming {
     start: Option<Instant>,
     lemmatisation: Option<std::time::Duration>,
-    database_query: Option<std::time::Duration>,
+    initial_database_query: Option<std::time::Duration>,
     tf_idf_calculation: Option<std::time::Duration>,
+    link_fetching: Option<std::time::Duration>,
     results_formatting: Option<std::time::Duration>,
     total_search_function: Option<std::time::Duration>,
 }
@@ -39,12 +40,20 @@ async fn main() {
     // Load top domains
     let top_domains = load_top_domains("top-1m.txt").await.expect("Failed to load top domains");
 
+    // Get MAX_RESULTS from environment variable
+    let max_results: usize = std::env
+        ::var("MAX_RESULTS")
+        .unwrap_or_else(|_| "100".to_string())
+        .parse()
+        .expect("MAX_RESULTS must be a valid number");
+
     // Set up the Axum router
     let app = Router::new()
         .route("/", get(search))
         .layer(Extension(pool))
         .layer(Extension(website_count))
         .layer(Extension(top_domains))
+        .layer(Extension(max_results))
         .layer(axum::middleware::map_request(timing_middleware));
 
     // Start the server
@@ -70,6 +79,7 @@ async fn search(
     Extension(pool): Extension<PgPool>,
     Extension(website_count): Extension<i64>,
     Extension(top_domains): Extension<HashMap<String, usize>>,
+    Extension(_max_results): Extension<usize>,
     mut timing: Extension<RequestTiming>
 ) -> Json<Value> {
     let search_start = Instant::now();
@@ -84,33 +94,49 @@ async fn search(
         .get("results")
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
+    let num_results = num_results.min(_max_results);
 
     // Lemmatize the query
     let lemmatise_time = Instant::now();
     let keywords = lemmatise::lemmatise_string(query);
     timing.lemmatisation = Some(lemmatise_time.elapsed());
 
-    // Fetch webpages from the database
+    // Fetch webpages from the database (without links initially)
     let db_time = Instant::now();
-    let webpages = match database::fetch_webpages(&pool, &keywords, include_links).await {
+    let webpages = match database::fetch_webpages(&pool, &keywords, false).await {
         Ok(webpages) => webpages,
         Err(e) => {
             return Json(json!({ "error": e.to_string() }));
         }
     };
-    timing.database_query = Some(db_time.elapsed());
+    timing.initial_database_query = Some(db_time.elapsed());
 
     // Calculate TF-IDF scores and rank webpages
     let tfidf_time = Instant::now();
-    let ranked_webpages = ranking::get_tf_idf_scores(website_count, &keywords, &webpages).await;
+    let mut ranked_webpages = ranking::get_tf_idf_scores(website_count, &keywords, &webpages).await;
 
     // Limit the number of results
-    let ranked_webpages: Vec<(f32, database::Webpage)> = ranked_webpages
-        .into_iter()
-        .take(num_results)
-        .collect();
-
+    ranked_webpages.truncate(num_results);
     timing.tf_idf_calculation = Some(tfidf_time.elapsed());
+
+    // Fetch links for top results if requested
+    if include_links {
+        let link_time = Instant::now();
+        let webpage_ids: Vec<i32> = ranked_webpages
+            .iter()
+            .map(|(_, webpage)| webpage.id)
+            .collect();
+
+        let links = database::fetch_links_for_ids(&pool, &webpage_ids).await.unwrap_or_default();
+
+        for (_score, webpage) in &mut ranked_webpages {
+            if let Some((links_to_count, links_from)) = links.get(&webpage.id) {
+                webpage.links_to_count = Some(*links_to_count);
+                webpage.links_from = Some(links_from.clone());
+            }
+        }
+        timing.link_fetching = Some(link_time.elapsed());
+    }
 
     // Format the results
     let results_time = Instant::now();
@@ -186,8 +212,9 @@ fn format_timing_info(timing: &RequestTiming, total_request_time: std::time::Dur
         "total_request": format!("{:?}", total_request_time),
         "total_search_function": format!("{:?}", timing.total_search_function.unwrap()),
         "lemmatisation": format!("{:?}", timing.lemmatisation.unwrap()),
-        "database_query": format!("{:?}", timing.database_query.unwrap()),
+        "initial_database_query": format!("{:?}", timing.initial_database_query.unwrap()),
         "tf_idf_calculation": format!("{:?}", timing.tf_idf_calculation.unwrap()),
+        "link_fetching": format!("{:?}", timing.link_fetching.unwrap()),
         "results_formatting": format!("{:?}", timing.results_formatting.unwrap()),
         "other_operations": format!("{:?}", total_request_time - timing.total_search_function.unwrap()),
     })
