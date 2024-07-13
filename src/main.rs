@@ -106,7 +106,13 @@ async fn main() {
         .layer(cors)
         .layer(axum::middleware::map_request(timing_middleware));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let port: u16 = std::env
+        ::var("AXUM_PORT")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse()
+        .expect("AXUM_PORT must be a valid number");
+
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
     println!("Listening on: http://{}", listener.local_addr().unwrap());
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }
