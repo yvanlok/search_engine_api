@@ -1,5 +1,10 @@
-use axum::{ routing::get, Router, response::Json };
-use axum::extract::{ Query, Extension };
+use axum::{
+    routing::get,
+    Router,
+    response::Json,
+    http::{ HeaderValue, Method },
+    extract::{ Query, Extension, ConnectInfo },
+};
 use std::collections::HashMap;
 use serde_json::{ Value, json };
 use sqlx::PgPool;
@@ -7,7 +12,12 @@ use dotenv::dotenv;
 use tokio::fs::File;
 use tokio::io::{ self, AsyncBufReadExt };
 use url::Url;
-use std::time::{ Duration, Instant };
+use std::time::{ Duration, Instant, SystemTime, UNIX_EPOCH };
+use tower_http::cors::CorsLayer;
+use reqwest::Client;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use std::net::SocketAddr;
 
 mod lemmatise;
 mod database;
@@ -17,49 +27,88 @@ mod ranking;
 #[derive(Default, Clone)]
 struct RequestTiming {
     start: Option<Instant>,
-    lemmatisation: Option<std::time::Duration>,
-    initial_database_query: Option<std::time::Duration>,
-    tf_idf_calculation: Option<std::time::Duration>,
-    link_fetching: Option<std::time::Duration>,
-    results_formatting: Option<std::time::Duration>,
-    total_search_function: Option<std::time::Duration>,
+    lemmatisation: Option<Duration>,
+    initial_database_query: Option<Duration>,
+    tf_idf_calculation: Option<Duration>,
+    link_fetching: Option<Duration>,
+    results_formatting: Option<Duration>,
+    total_search_function: Option<Duration>,
+}
+
+struct TokenCache {
+    tokens: HashMap<String, (u64, String)>,
+}
+
+impl TokenCache {
+    fn new() -> Self {
+        TokenCache {
+            tokens: HashMap::new(),
+        }
+    }
+
+    fn is_valid(&mut self, token: &str, ip: &str) -> bool {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        if let Some((timestamp, stored_ip)) = self.tokens.get(token) {
+            if now - timestamp <= 120 && stored_ip == ip {
+                // 2 minutes
+                return true;
+            }
+        }
+        false
+    }
+
+    fn add_token(&mut self, token: String, ip: String) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.tokens.insert(token, (now, ip));
+    }
+
+    fn clean_old_tokens(&mut self) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.tokens.retain(|_, &mut (timestamp, _)| now - timestamp <= 120);
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    // Load environment variables from .env file
     dotenv().ok();
 
-    // Connect to the database
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPool::connect(&database_url).await.expect("Failed to connect to database");
     let website_count = database::count_websites(&pool).await.expect("Failed to count websites");
 
     println!("Connected to database. Found {} websites.", website_count);
 
-    // Load top domains
     let top_domains = load_top_domains("top-1m.txt").await.expect("Failed to load top domains");
 
-    // Get MAX_RESULTS from environment variable
     let max_results: usize = std::env
         ::var("MAX_RESULTS")
         .unwrap_or_else(|_| "100".to_string())
         .parse()
         .expect("MAX_RESULTS must be a valid number");
 
-    // Set up the Axum router
+    let token_cache = Arc::new(Mutex::new(TokenCache::new()));
+
+    // Create a CORS layer
+    let cors = CorsLayer::new()
+        .allow_origin("http://localhost:3001".parse::<HeaderValue>().unwrap())
+        .allow_methods([Method::GET])
+        .allow_headers(vec![axum::http::header::CONTENT_TYPE]);
+
+    // Set up the Axum router with CORS
     let app = Router::new()
         .route("/", get(search))
         .layer(Extension(pool))
         .layer(Extension(website_count))
         .layer(Extension(top_domains))
         .layer(Extension(max_results))
+        .layer(Extension(Client::new()))
+        .layer(Extension(token_cache))
+        .layer(cors)
         .layer(axum::middleware::map_request(timing_middleware));
 
-    // Start the server
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("Listening on: http://{}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }
 
 async fn timing_middleware(
@@ -75,11 +124,14 @@ async fn timing_middleware(
 }
 
 async fn search(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(params): Query<HashMap<String, String>>,
     Extension(pool): Extension<PgPool>,
     Extension(website_count): Extension<i64>,
     Extension(top_domains): Extension<HashMap<String, usize>>,
     Extension(_max_results): Extension<usize>,
+    Extension(client): Extension<Client>,
+    Extension(token_cache): Extension<Arc<Mutex<TokenCache>>>,
     mut timing: Extension<RequestTiming>
 ) -> Json<Value> {
     let search_start = Instant::now();
@@ -96,6 +148,30 @@ async fn search(
         .unwrap_or(100);
     let num_results = num_results.min(_max_results);
 
+    // Extract Turnstile token
+    let turnstile_token = params.get("token").expect("Missing Turnstile token");
+
+    // Check if the token is in the cache
+
+    let ip = addr.ip().to_string();
+    let mut cache = token_cache.lock().await;
+    if !cache.is_valid(turnstile_token, ip.as_str()) {
+        // If not in cache, validate with Turnstile
+        if !validate_turnstile_token(&client, turnstile_token).await {
+            println!("Token validation failed for IP: {}", addr.ip());
+            return Json(json!({ "error": "Invalid Turnstile token" }));
+        } else {
+            println!("Token validated for IP: {}", ip);
+        }
+        // If valid, add to cache
+        cache.add_token(turnstile_token.to_string(), ip);
+    } else {
+        println!("Token already in cache for IP: {}", ip);
+    }
+    // Clean old tokens from cache
+    cache.clean_old_tokens();
+    drop(cache);
+
     // Lemmatize the query
     let lemmatise_time = Instant::now();
     let keywords = lemmatise::lemmatise_string(query);
@@ -109,14 +185,31 @@ async fn search(
             return Json(json!({ "error": e.to_string() }));
         }
     };
+
+    let matching_webpages = webpages.len();
+
     timing.initial_database_query = Some(db_time.elapsed());
 
     // Calculate TF-IDF scores and rank webpages
     let tfidf_time = Instant::now();
     let mut ranked_webpages = ranking::get_tf_idf_scores(website_count, &keywords, &webpages).await;
 
+    // Sort ranked_webpages by score in descending order
+    ranked_webpages.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+    // Determine the number of results to return
+    let results_to_return = if !ranked_webpages.is_empty() && ranked_webpages[0].0 == 1.0 {
+        let count_score_one = ranked_webpages
+            .iter()
+            .take_while(|(score, _)| *score == 1.0)
+            .count();
+        count_score_one.max(num_results)
+    } else {
+        num_results
+    };
+
     // Limit the number of results
-    ranked_webpages.truncate(num_results);
+    ranked_webpages.truncate(results_to_return);
     timing.tf_idf_calculation = Some(tfidf_time.elapsed());
 
     // Fetch links for top results if requested
@@ -155,12 +248,37 @@ async fn search(
         json!({
         "query": query,
         "lemmatised_keywords": keywords,
-        "results_count": results.len(),
+        "matching_webpages": matching_webpages,
         "time_taken": format_timing_info(&timing, total_request_time),
         "website_count": website_count,
         "results": results,
     })
     )
+}
+
+async fn validate_turnstile_token(client: &Client, token: &str) -> bool {
+    let secret_key = std::env
+        ::var("CLOUDFLARE_TURNSTILE_SECRET_KEY")
+        .expect("CLOUDFLARE_TURNSTILE_SECRET_KEY must be set");
+    let url = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
+    let params = [
+        ("secret", secret_key),
+        ("response", token.to_string()),
+    ];
+
+    let response = client.post(url).form(&params).send().await;
+
+    match response {
+        Ok(res) => {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                json["success"].as_bool().unwrap_or(false)
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
 }
 
 fn format_result(
@@ -207,7 +325,7 @@ fn format_result(
     result
 }
 
-fn format_timing_info(timing: &RequestTiming, total_request_time: std::time::Duration) -> Value {
+fn format_timing_info(timing: &RequestTiming, total_request_time: Duration) -> Value {
     json!({
         "total_request": format!("{:?}", total_request_time),
         "total_search_function": format!("{:?}", timing.total_search_function.unwrap_or_default()),
