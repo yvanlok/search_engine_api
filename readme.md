@@ -1,20 +1,61 @@
-# Goal
+# Search Engine API
 
-- Create fast, efficient and open-source search engine in rust
+This repository contains the API for a fast, efficient, and open-source search engine built in Rust.
 
-# Plan
+## Features
 
-## Search engine crawler:
+- Calculate TF-IDF at runtime using a database of crawled web pages.
+- Return search results ranked by relevance.
+- Provide detailed statistics for each result.
 
-- Download crawled web pages of top `x` websites
-- Add relevant data to database
+## Getting Started
 
-## API:
+### Prerequisites
 
-- Calculate TF-IDF at runtime using database
-- Return results with ranking algorithm (pages linked)
+- Rust (latest stable version)
+- PostgreSQL
 
-## Front-end:
+### Installation
 
-- Simple, clean interface
-- Cloudflare protected
+1. **Clone the repository:**
+
+   ```sh
+   git clone https://github.com/yvanlok/search_engine_api.git
+   cd search_engine_api
+   ```
+
+2. **Install dependencies:**
+
+   ```sh
+   cargo build
+   ```
+
+3. **Set up the database:**
+
+   ```sh
+   psql -U postgres -f schema.sql
+   ```
+
+4. **Run the API:**
+   ```sh
+   cargo run
+   ```
+
+### API Endpoints
+
+- **GET /search**
+  - Parameters: `query` (string)
+  - Description: Returns search results based on the provided query. Results are ranked using a TF-IDF algorithm.
+
+## Related Projects
+
+- [Search Engine Crawler](https://github.com/yvanlok/search_engine_crawler)
+- [Search Engine UI](https://github.com/yvanlok/search-engine-ui)
+
+## Contributing
+
+1. Fork the repository.
+2. Create your feature branch (`git checkout -b feature/new-feature`).
+3. Commit your changes (`git commit -am 'Add new feature'`).
+4. Push to the branch (`git push origin feature/new-feature`).
+5. Create a new Pull Request.
