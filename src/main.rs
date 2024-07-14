@@ -90,8 +90,15 @@ async fn main() {
 
     // Create a CORS layer
     let cors = CorsLayer::new()
-        .allow_origin("http://localhost:3001".parse::<HeaderValue>().unwrap())
-        .allow_methods([Method::GET])
+        .allow_origin(
+            vec![
+                "http://localhost:3000".parse::<HeaderValue>().unwrap(),
+                "http://localhost:3001".parse::<HeaderValue>().unwrap(),
+                "http://search.ylokhmotov.dev".parse::<HeaderValue>().unwrap(),
+                "https://search.ylokhmotov.dev".parse::<HeaderValue>().unwrap()
+            ]
+        )
+        .allow_methods(vec![Method::GET])
         .allow_headers(vec![axum::http::header::CONTENT_TYPE]);
 
     // Set up the Axum router with CORS
