@@ -210,16 +210,41 @@ async fn search(
     // Sort ranked_webpages by score in descending order
     ranked_webpages.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
+    // Extract num_results from params
+    let num_results = params
+        .get("results")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+        .min(_max_results);
+
+    // Count webpages with score >= 1.0
+    let high_score_count = ranked_webpages
+        .iter()
+        .take_while(|(score, _)| *score >= 1.0)
+        .count();
+
+    // Sort webpages with score >= 1.0 by score first, then by website rank
+    if high_score_count > 0 {
+        ranked_webpages[..high_score_count].sort_by(|a, b| {
+            b.0
+                .partial_cmp(&a.0)
+                .unwrap()
+                .then_with(|| {
+                    let domain_a = extract_domain_from_string(&a.1.url);
+                    let domain_b = extract_domain_from_string(&b.1.url);
+                    let rank_a = domain_a
+                        .and_then(|d| top_domains.get(&d).cloned())
+                        .unwrap_or(usize::MAX);
+                    let rank_b = domain_b
+                        .and_then(|d| top_domains.get(&d).cloned())
+                        .unwrap_or(usize::MAX);
+                    rank_a.cmp(&rank_b)
+                })
+        });
+    }
+
     // Determine the number of results to return
-    let results_to_return = if !ranked_webpages.is_empty() && ranked_webpages[0].0 == 1.0 {
-        let count_score_one = ranked_webpages
-            .iter()
-            .take_while(|(score, _)| *score == 1.0)
-            .count();
-        count_score_one.max(num_results)
-    } else {
-        num_results
-    };
+    let results_to_return = high_score_count.min(num_results);
 
     // Limit the number of results
     ranked_webpages.truncate(results_to_return);
