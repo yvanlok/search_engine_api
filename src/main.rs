@@ -11,8 +11,7 @@ use sqlx::PgPool;
 use dotenv::dotenv;
 use tokio::fs::File;
 use tokio::io::{ self, AsyncBufReadExt };
-use url::Url;
-use std::time::{ Duration, Instant, SystemTime, UNIX_EPOCH };
+use std::time::Instant;
 use tower_http::cors::CorsLayer;
 use reqwest::Client;
 use std::sync::Arc;
@@ -22,97 +21,48 @@ use std::net::SocketAddr;
 mod lemmatise;
 mod database;
 mod ranking;
+mod token_cache;
+mod timing;
+mod turnstile;
+mod result_formatter;
 
-/// Struct to store timing information for various parts of the request processing
-#[derive(Default, Clone)]
-struct RequestTiming {
-    start: Option<Instant>,
-    lemmatisation: Option<Duration>,
-    initial_database_query: Option<Duration>,
-    tf_idf_calculation: Option<Duration>,
-    link_fetching: Option<Duration>,
-    results_formatting: Option<Duration>,
-    total_search_function: Option<Duration>,
-}
-
-struct TokenCache {
-    tokens: HashMap<String, (u64, String)>,
-}
-
-impl TokenCache {
-    fn new() -> Self {
-        TokenCache {
-            tokens: HashMap::new(),
-        }
-    }
-
-    fn is_valid(&mut self, token: &str, ip: &str) -> bool {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        if let Some((timestamp, stored_ip)) = self.tokens.get(token) {
-            if now - timestamp <= 120 && stored_ip == ip {
-                // 2 minutes
-                return true;
-            }
-        }
-        false
-    }
-
-    fn add_token(&mut self, token: String, ip: String) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        self.tokens.insert(token, (now, ip));
-    }
-
-    fn clean_old_tokens(&mut self) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        self.tokens.retain(|_, &mut (timestamp, _)| now - timestamp <= 120);
-    }
-}
+use token_cache::TokenCache;
+use timing::RequestTiming;
+use turnstile::validate_turnstile_token;
+use result_formatter::format_result;
 
 #[tokio::main]
 async fn main() {
+    // Load environment variables
     dotenv().ok();
 
+    // Set up database connection
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPool::connect(&database_url).await.expect("Failed to connect to database");
     let website_count = database::count_websites(&pool).await.expect("Failed to count websites");
 
     println!("Connected to database. Found {} websites.", website_count);
 
+    // Load top domains
     let top_domains = load_top_domains("top-1m.txt").await.expect("Failed to load top domains");
-
+    // println!("Top domains: {:?}", top_domains);
+    // Get max results from environment variable
     let max_results: usize = std::env
         ::var("MAX_RESULTS")
         .unwrap_or_else(|_| "100".to_string())
         .parse()
         .expect("MAX_RESULTS must be a valid number");
 
+    // Initialize token cache
     let token_cache = Arc::new(Mutex::new(TokenCache::new()));
 
-    // Create a CORS layer
-    let cors = CorsLayer::new()
-        .allow_origin(
-            vec![
-                "http://localhost:3000".parse::<HeaderValue>().unwrap(),
-                "http://localhost:3001".parse::<HeaderValue>().unwrap(),
-                "http://search.ylokhmotov.dev".parse::<HeaderValue>().unwrap(),
-                "https://search.ylokhmotov.dev".parse::<HeaderValue>().unwrap()
-            ]
-        )
-        .allow_methods(vec![Method::GET])
-        .allow_headers(vec![axum::http::header::CONTENT_TYPE]);
+    // Set up CORS
+    let cors = create_cors_layer();
 
-    // Set up the Axum router with CORS
-    let app = Router::new()
-        .route("/", get(search))
-        .layer(Extension(pool))
-        .layer(Extension(website_count))
-        .layer(Extension(top_domains))
-        .layer(Extension(max_results))
-        .layer(Extension(Client::new()))
-        .layer(Extension(token_cache))
-        .layer(cors)
-        .layer(axum::middleware::map_request(timing_middleware));
+    // Set up the Axum router
+    let app = create_router(pool, website_count, top_domains, max_results, token_cache, cors);
 
+    // Start the server
     let port: u16 = std::env
         ::var("AXUM_PORT")
         .unwrap_or_else(|_| "3000".to_string())
@@ -122,6 +72,40 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
     println!("Listening on: http://{}", listener.local_addr().unwrap());
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+}
+
+fn create_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(
+            vec![
+                "http://localhost:3000".parse::<HeaderValue>().unwrap(),
+                "http://localhost:3001".parse::<HeaderValue>().unwrap(),
+                "http://search.ylokhmotov.dev".parse::<HeaderValue>().unwrap(),
+                "https://search.ylokhmotov.dev".parse::<HeaderValue>().unwrap()
+            ]
+        )
+        .allow_methods(vec![Method::GET])
+        .allow_headers(vec![axum::http::header::CONTENT_TYPE])
+}
+
+fn create_router(
+    pool: PgPool,
+    website_count: i64,
+    top_domains: HashMap<String, usize>,
+    max_results: usize,
+    token_cache: Arc<Mutex<TokenCache>>,
+    cors: CorsLayer
+) -> Router {
+    Router::new()
+        .route("/", get(search))
+        .layer(Extension(pool))
+        .layer(Extension(website_count))
+        .layer(Extension(top_domains))
+        .layer(Extension(max_results))
+        .layer(Extension(Client::new()))
+        .layer(Extension(token_cache))
+        .layer(cors)
+        .layer(axum::middleware::map_request(timing_middleware))
 }
 
 async fn timing_middleware(
@@ -142,7 +126,7 @@ async fn search(
     Extension(pool): Extension<PgPool>,
     Extension(website_count): Extension<i64>,
     Extension(top_domains): Extension<HashMap<String, usize>>,
-    Extension(_max_results): Extension<usize>,
+    Extension(max_results): Extension<usize>,
     Extension(client): Extension<Client>,
     Extension(token_cache): Extension<Arc<Mutex<TokenCache>>>,
     mut timing: Extension<RequestTiming>
@@ -150,7 +134,53 @@ async fn search(
     let search_start = Instant::now();
 
     // Extract query parameters
-    let query = params.get("q").expect("Missing query parameter");
+    let (query, include_links, num_results) = extract_query_params(&params, max_results);
+
+    // Validate Turnstile token
+    let turnstile_start = Instant::now();
+    let turnstile_token = params.get("token").expect("Missing Turnstile token");
+    let ip = addr.ip().to_string();
+    if !validate_token(&client, turnstile_token, &ip, &token_cache).await {
+        return Json(json!({ "error": "Invalid Turnstile token" }));
+    }
+    timing.turnstile_validation = Some(turnstile_start.elapsed());
+
+    // Perform search
+    let search_result = perform_search(
+        &query,
+        &pool,
+        website_count,
+        &top_domains,
+        include_links,
+        num_results,
+        &mut timing
+    ).await;
+
+    timing.total_search_function = Some(search_start.elapsed());
+
+    let total_request_time = timing.start.unwrap().elapsed();
+
+    // Create the response JSON directly
+    Json(
+        json!({
+        "query": query,
+        "lemmatised_keywords": [], // Update this if you want to include lemmatized keywords
+        "matching_webpages": search_result.len(),
+        "time_taken": timing::format_timing_info(&timing, total_request_time),
+        "website_count": website_count,
+        "results": search_result.iter().map(|(score, webpage)| 
+            format_result(score, webpage, &top_domains, include_links)).collect::<Vec<_>>(),
+    })
+    )
+}
+
+// Helper functions (implement these in separate modules)
+
+fn extract_query_params(
+    params: &HashMap<String, String>,
+    max_results: usize
+) -> (String, bool, usize) {
+    let query = params.get("q").expect("Missing query parameter").to_string();
     let include_links = params
         .get("links")
         .map(|v| v == "true")
@@ -158,33 +188,38 @@ async fn search(
     let num_results = params
         .get("results")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
-    let num_results = num_results.min(_max_results);
+        .unwrap_or(100)
+        .min(max_results);
+    (query, include_links, num_results)
+}
 
-    // Extract Turnstile token
-    let turnstile_token = params.get("token").expect("Missing Turnstile token");
-
-    // Check if the token is in the cache
-
-    let ip = addr.ip().to_string();
+async fn validate_token(
+    client: &Client,
+    token: &str,
+    ip: &str,
+    token_cache: &Arc<Mutex<TokenCache>>
+) -> bool {
     let mut cache = token_cache.lock().await;
-    if !cache.is_valid(turnstile_token, ip.as_str()) {
-        // If not in cache, validate with Turnstile
-        if !validate_turnstile_token(&client, turnstile_token).await {
-            println!("Token validation failed for IP: {}", addr.ip());
-            return Json(json!({ "error": "Invalid Turnstile token" }));
-        } else {
-            println!("Token validated for IP: {}", ip);
+    if !cache.is_valid(token, ip) {
+        if !validate_turnstile_token(client, token).await {
+            println!("Token validation failed for IP: {}", ip);
+            return false;
         }
-        // If valid, add to cache
-        cache.add_token(turnstile_token.to_string(), ip);
-    } else {
-        println!("Token already in cache for IP: {}", ip);
+        cache.add_token(token.to_string(), ip.to_string());
     }
-    // Clean old tokens from cache
     cache.clean_old_tokens();
-    drop(cache);
+    true
+}
 
+async fn perform_search(
+    query: &str,
+    pool: &PgPool,
+    website_count: i64,
+    top_domains: &HashMap<String, usize>,
+    include_links: bool,
+    num_results: usize,
+    timing: &mut RequestTiming
+) -> Vec<(f32, database::Webpage)> {
     // Lemmatize the query
     let lemmatise_time = Instant::now();
     let keywords = lemmatise::lemmatise_string(query);
@@ -192,15 +227,13 @@ async fn search(
 
     // Fetch webpages from the database (without links initially)
     let db_time = Instant::now();
-    let webpages = match database::fetch_webpages(&pool, &keywords, false).await {
+    let webpages = match database::fetch_webpages(pool, &keywords, false).await {
         Ok(webpages) => webpages,
         Err(e) => {
-            return Json(json!({ "error": e.to_string() }));
+            eprintln!("Error fetching webpages: {}", e);
+            return vec![];
         }
     };
-
-    let matching_webpages = webpages.len();
-
     timing.initial_database_query = Some(db_time.elapsed());
 
     // Calculate TF-IDF scores and rank webpages
@@ -209,13 +242,6 @@ async fn search(
 
     // Sort ranked_webpages by score in descending order
     ranked_webpages.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-
-    // Extract num_results from params
-    let num_results = params
-        .get("results")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100)
-        .min(_max_results);
 
     // Count webpages with score >= 1.0
     let high_score_count = ranked_webpages
@@ -230,8 +256,8 @@ async fn search(
                 .partial_cmp(&a.0)
                 .unwrap()
                 .then_with(|| {
-                    let domain_a = extract_domain_from_string(&a.1.url);
-                    let domain_b = extract_domain_from_string(&b.1.url);
+                    let domain_a = result_formatter::extract_domain_from_string(&a.1.url);
+                    let domain_b = result_formatter::extract_domain_from_string(&b.1.url);
                     let rank_a = domain_a
                         .and_then(|d| top_domains.get(&d).cloned())
                         .unwrap_or(usize::MAX);
@@ -258,7 +284,7 @@ async fn search(
             .map(|(_, webpage)| webpage.id)
             .collect();
 
-        let links = database::fetch_links_for_ids(&pool, &webpage_ids).await.unwrap_or_default();
+        let links = database::fetch_links_for_ids(pool, &webpage_ids).await.unwrap_or_default();
 
         for (_score, webpage) in &mut ranked_webpages {
             if let Some((links_to_count, links_from)) = links.get(&webpage.id) {
@@ -269,127 +295,14 @@ async fn search(
         timing.link_fetching = Some(link_time.elapsed());
     }
 
-    // Format the results
-    let results_time = Instant::now();
-    let results: Vec<Value> = ranked_webpages
-        .iter()
-        .map(|(score, webpage)| format_result(score, webpage, &top_domains, include_links))
-        .collect();
-    timing.results_formatting = Some(results_time.elapsed());
-
-    timing.total_search_function = Some(search_start.elapsed());
-
-    let total_request_time = timing.start.unwrap().elapsed();
-
-    // Return the JSON response
-    Json(
-        json!({
-        "query": query,
-        "lemmatised_keywords": keywords,
-        "matching_webpages": matching_webpages,
-        "time_taken": format_timing_info(&timing, total_request_time),
-        "website_count": website_count,
-        "results": results,
-    })
-    )
-}
-
-async fn validate_turnstile_token(client: &Client, token: &str) -> bool {
-    let secret_key = std::env
-        ::var("CLOUDFLARE_TURNSTILE_SECRET_KEY")
-        .expect("CLOUDFLARE_TURNSTILE_SECRET_KEY must be set");
-    let url = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
-
-    let params = [
-        ("secret", secret_key),
-        ("response", token.to_string()),
-    ];
-
-    let response = client.post(url).form(&params).send().await;
-
-    match response {
-        Ok(res) => {
-            if let Ok(json) = res.json::<serde_json::Value>().await {
-                json["success"].as_bool().unwrap_or(false)
-            } else {
-                false
-            }
-        }
-        Err(_) => false,
-    }
-}
-
-fn format_result(
-    score: &f32,
-    webpage: &database::Webpage,
-    top_domains: &HashMap<String, usize>,
-    include_links: bool
-) -> Value {
-    // Extract domain and get top website rank
-    let domain = extract_domain_from_string(&webpage.url);
-    let top_website_rank = domain
-        .as_ref()
-        .and_then(|d| top_domains.get(d).cloned())
-        .unwrap_or_default();
-
-    // Create the base result JSON
-    let mut result =
-        json!({
-        "title": webpage.title,
-        "url": webpage.url,
-        "description": webpage.description,
-        "score": score,
-        "keywords": webpage.keywords.iter().map(|(keyword, &occurrences)| {
-            json!({ "keyword": keyword.word, "occurrences": occurrences })
-        }).collect::<Vec<_>>(),
-        "top_website_rank": top_website_rank,
-    });
-
-    // Add link information if requested
-    if include_links {
-        if let Some(links_to_count) = webpage.links_to_count {
-            result["links_to_count"] = json!(links_to_count);
-        }
-        if let Some(links_from) = &webpage.links_from {
-            result["links_from"] = json!(
-                links_from
-                    .iter()
-                    .map(|(link, &count)| { json!({ "link": link, "occurrences": count }) })
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
-
-    result
-}
-
-fn format_timing_info(timing: &RequestTiming, total_request_time: Duration) -> Value {
-    json!({
-        "total_request": format!("{:?}", total_request_time),
-        "total_search_function": format!("{:?}", timing.total_search_function.unwrap_or_default()),
-        "lemmatisation": format!("{:?}", timing.lemmatisation.unwrap_or_default()),
-        "initial_database_query": format!("{:?}", timing.initial_database_query.unwrap_or_default()),
-        "tf_idf_calculation": format!("{:?}", timing.tf_idf_calculation.unwrap_or_default()),
-        "link_fetching": format!("{:?}", timing.link_fetching.unwrap_or_default()),
-        "results_formatting": format!("{:?}", timing.results_formatting.unwrap_or_default()),
-        "other_operations": format!("{:?}", total_request_time - timing.total_search_function.unwrap_or_default()),
-    })
-}
-
-fn extract_domain_from_string(url: &str) -> Option<String> {
-    // Parse the URL and extract the host (domain)
-    Url::parse(url)
-        .ok()
-        .and_then(|parsed_url| parsed_url.host_str().map(String::from))
+    ranked_webpages
 }
 
 async fn load_top_domains(filename: &str) -> io::Result<HashMap<String, usize>> {
-    // Open and read the file containing top domains
     let file = File::open(filename).await?;
     let reader = io::BufReader::new(file);
     let mut top_domains = HashMap::new();
 
-    // Parse each line and insert into the HashMap
     let mut lines = reader.lines();
     let mut rank = 1;
     while let Some(line) = lines.next_line().await? {

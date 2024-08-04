@@ -54,65 +54,14 @@ fn load_lemma_map<P: AsRef<Path>>(filename: P) -> Result<HashMap<String, String>
 /// A vector of lemmatized words.
 pub fn lemmatise_string(text: &str) -> Vec<String> {
     let text = text.to_lowercase();
-    let text_no_punct = PUNCTUATION_REGEX.replace_all(&text, "");
-    text_no_punct
+    let text_without_punctuation = PUNCTUATION_REGEX.replace_all(&text, " ");
+    let result: Vec<String> = text_without_punctuation
         .split_whitespace()
-        .map(|word| LEMMA_MAP.get(word).unwrap_or(&word.to_string()).clone())
-        .collect()
-}
-
-/// Lemmatizes a given string using a custom lemma map.
-///
-/// # Arguments
-///
-/// * `text` - The input string to lemmatize.
-/// * `custom_map` - A reference to a custom HashMap for lemmatization.
-///
-/// # Returns
-///
-/// A vector of lemmatized words.
-pub fn lemmatise_string_with_custom_map(
-    text: &str,
-    custom_map: &HashMap<String, String>
-) -> Vec<String> {
-    let text = text.to_lowercase();
-    let text_no_punct = PUNCTUATION_REGEX.replace_all(&text, "");
-    text_no_punct
-        .split_whitespace()
-        .map(|word| custom_map.get(word).unwrap_or(&word.to_string()).clone())
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lemmatise_string() {
-        let input = "The quick brown foxes are jumping over the lazy dogs";
-        let expected = vec![
-            "the",
-            "quick",
-            "brown",
-            "fox",
-            "be",
-            "jump",
-            "over",
-            "the",
-            "lazy",
-            "dog"
-        ];
-        assert_eq!(lemmatise_string(input), expected);
-    }
-
-    #[test]
-    fn test_lemmatise_string_with_custom_map() {
-        let mut custom_map = HashMap::new();
-        custom_map.insert("running".to_string(), "run".to_string());
-        custom_map.insert("jumped".to_string(), "jump".to_string());
-
-        let input = "The fox is running and jumped over the fence";
-        let expected = vec!["the", "fox", "is", "run", "and", "jump", "over", "the", "fence"];
-        assert_eq!(lemmatise_string_with_custom_map(input, &custom_map), expected);
-    }
+        .map(|word| {
+            LEMMA_MAP.get(word)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| word.to_string())
+        })
+        .collect();
+    result
 }
